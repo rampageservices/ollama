@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"context"
@@ -122,9 +122,11 @@ func (s *Server) NewSequence(prompt string, images []ImageData, params NewSequen
 	params.numKeep = min(params.numKeep, s.cache.numCtx-1)
 
 	if len(inputs) > s.cache.numCtx {
-		slog.Warn("truncating input prompt", "limit", s.cache.numCtx, "prompt", len(inputs), "numKeep", params.numKeep)
+		discard := len(inputs) - s.cache.numCtx
 		newInputs := inputs[:params.numKeep]
-		newInputs = append(newInputs, inputs[len(inputs)-s.cache.numCtx+params.numKeep:]...)
+		newInputs = append(newInputs, inputs[params.numKeep+discard:]...)
+
+		slog.Warn("truncating input prompt", "limit", s.cache.numCtx, "prompt", len(inputs), "keep", params.numKeep, "new", len(newInputs))
 		inputs = newInputs
 	}
 
@@ -162,10 +164,16 @@ func (s *Server) NewSequence(prompt string, images []ImageData, params NewSequen
 // generating image embeddings for each image
 func (s *Server) inputs(prompt string, images []ImageData) ([]input, error) {
 	var inputs []input
+	var parts []string
+	var matches [][]string
 
-	re := regexp.MustCompile(`\[img-(\d+)\]`)
-	parts := re.Split(prompt, -1)
-	matches := re.FindAllStringSubmatch(prompt, -1)
+	if s.image != nil {
+		re := regexp.MustCompile(`\[img-(\d+)\]`)
+		parts = re.Split(prompt, -1)
+		matches = re.FindAllStringSubmatch(prompt, -1)
+	} else {
+		parts = []string{prompt}
+	}
 
 	for i, part := range parts {
 		// text - tokenize
@@ -551,7 +559,6 @@ type Options struct {
 	TopK             int      `json:"top_k"`
 	TopP             float32  `json:"top_p"`
 	MinP             float32  `json:"min_p"`
-	TFSZ             float32  `json:"tfs_z"`
 	TypicalP         float32  `json:"typical_p"`
 	RepeatLastN      int      `json:"repeat_last_n"`
 	Temperature      float32  `json:"temperature"`
@@ -624,7 +631,6 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 	samplingParams.TopK = req.TopK
 	samplingParams.TopP = req.TopP
 	samplingParams.MinP = req.MinP
-	samplingParams.TfsZ = req.TFSZ
 	samplingParams.TypicalP = req.TypicalP
 	samplingParams.Temp = req.Temperature
 	samplingParams.RepeatLastN = req.RepeatLastN
@@ -825,12 +831,24 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type multiLPath []string
+
+func (m *multiLPath) Set(value string) error {
+	*m = append(*m, value)
+	return nil
+}
+
+func (m *multiLPath) String() string {
+	return strings.Join(*m, ", ")
+}
+
 func (s *Server) loadModel(
 	params llama.ModelParams,
 	mpath string,
-	lpath string,
+	lpath multiLPath,
 	ppath string,
 	kvSize int,
+	kvCacheType string,
 	flashAttention bool,
 	threads int,
 	multiUserCache bool,
@@ -843,16 +861,18 @@ func (s *Server) loadModel(
 		panic(err)
 	}
 
-	ctxParams := llama.NewContextParams(kvSize, s.batchSize*s.parallel, s.parallel, threads, flashAttention)
+	ctxParams := llama.NewContextParams(kvSize, s.batchSize*s.parallel, s.parallel, threads, flashAttention, kvCacheType)
 	s.lc, err = llama.NewContextWithModel(s.model, ctxParams)
 	if err != nil {
 		panic(err)
 	}
 
-	if lpath != "" {
-		err := s.model.ApplyLoraFromFile(s.lc, lpath, 1.0, threads)
-		if err != nil {
-			panic(err)
+	if lpath.String() != "" {
+		for _, path := range lpath {
+			err := s.model.ApplyLoraFromFile(s.lc, path, 1.0, threads)
+			if err != nil {
+				panic(err)
+			}
 		}
 	}
 
@@ -873,33 +893,42 @@ func (s *Server) loadModel(
 	s.ready.Done()
 }
 
-func main() {
-	mpath := flag.String("model", "", "Path to model binary file")
-	ppath := flag.String("mmproj", "", "Path to projector binary file")
-	parallel := flag.Int("parallel", 1, "Number of sequences to handle simultaneously")
-	batchSize := flag.Int("batch-size", 512, "Batch size")
-	nGpuLayers := flag.Int("n-gpu-layers", 0, "Number of layers to offload to GPU")
-	mainGpu := flag.Int("main-gpu", 0, "Main GPU")
-	flashAttention := flag.Bool("flash-attn", false, "Enable flash attention")
-	kvSize := flag.Int("ctx-size", 2048, "Context (or KV cache) size")
-	lpath := flag.String("lora", "", "Path to lora layer file")
-	port := flag.Int("port", 8080, "Port to expose the server on")
-	threads := flag.Int("threads", runtime.NumCPU(), "Number of threads to use during generation")
-	verbose := flag.Bool("verbose", false, "verbose output (default: disabled)")
-	noMmap := flag.Bool("no-mmap", false, "do not memory-map model (slower load but may reduce pageouts if not using mlock)")
-	mlock := flag.Bool("mlock", false, "force system to keep model in RAM rather than swapping or compressing")
-	tensorSplit := flag.String("tensor-split", "", "fraction of the model to offload to each GPU, comma-separated list of proportions")
-	multiUserCache := flag.Bool("multiuser-cache", false, "optimize input cache algorithm for multiple users")
-	requirements := flag.Bool("requirements", false, "print json requirement information")
+func Execute(args []string) error {
+	if args[0] == "runner" {
+		args = args[1:]
+	}
+	fs := flag.NewFlagSet("runner", flag.ExitOnError)
+	mpath := fs.String("model", "", "Path to model binary file")
+	ppath := fs.String("mmproj", "", "Path to projector binary file")
+	parallel := fs.Int("parallel", 1, "Number of sequences to handle simultaneously")
+	batchSize := fs.Int("batch-size", 512, "Batch size")
+	nGpuLayers := fs.Int("n-gpu-layers", 0, "Number of layers to offload to GPU")
+	mainGpu := fs.Int("main-gpu", 0, "Main GPU")
+	flashAttention := fs.Bool("flash-attn", false, "Enable flash attention")
+	kvSize := fs.Int("ctx-size", 2048, "Context (or KV cache) size")
+	kvCacheType := fs.String("kv-cache-type", "", "quantization type for KV cache (default: f16)")
+	port := fs.Int("port", 8080, "Port to expose the server on")
+	threads := fs.Int("threads", runtime.NumCPU(), "Number of threads to use during generation")
+	verbose := fs.Bool("verbose", false, "verbose output (default: disabled)")
+	noMmap := fs.Bool("no-mmap", false, "do not memory-map model (slower load but may reduce pageouts if not using mlock)")
+	mlock := fs.Bool("mlock", false, "force system to keep model in RAM rather than swapping or compressing")
+	tensorSplit := fs.String("tensor-split", "", "fraction of the model to offload to each GPU, comma-separated list of proportions")
+	multiUserCache := fs.Bool("multiuser-cache", false, "optimize input cache algorithm for multiple users")
 
-	flag.Parse()
-	if *requirements {
-		printRequirements(os.Stdout)
-		return
+	var lpaths multiLPath
+	fs.Var(&lpaths, "lora", "Path to lora layer file (can be specified multiple times)")
+
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Runner usage\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
 	level := slog.LevelInfo
 	if *verbose {
 		level = slog.LevelDebug
+		llama.EnableDebug()
 	}
 	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level:     level,
@@ -938,7 +967,7 @@ func main() {
 	params := llama.ModelParams{
 		NumGpuLayers: *nGpuLayers,
 		MainGpu:      *mainGpu,
-		UseMmap:      !*noMmap && *lpath == "",
+		UseMmap:      !*noMmap && lpaths.String() == "",
 		UseMlock:     *mlock,
 		TensorSplit:  tensorSplitFloats,
 		Progress: func(progress float32) {
@@ -947,7 +976,7 @@ func main() {
 	}
 
 	server.ready.Add(1)
-	go server.loadModel(params, *mpath, *lpath, *ppath, *kvSize, *flashAttention, *threads, *multiUserCache)
+	go server.loadModel(params, *mpath, lpaths, *ppath, *kvSize, *kvCacheType, *flashAttention, *threads, *multiUserCache)
 
 	server.cond = sync.NewCond(&server.mu)
 
@@ -958,7 +987,8 @@ func main() {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		fmt.Println("Listen error:", err)
-		return
+		cancel()
+		return err
 	}
 	defer listener.Close()
 
@@ -974,7 +1004,9 @@ func main() {
 	log.Println("Server listening on", addr)
 	if err := httpServer.Serve(listener); err != nil {
 		log.Fatal("server error:", err)
+		return err
 	}
 
 	cancel()
+	return nil
 }

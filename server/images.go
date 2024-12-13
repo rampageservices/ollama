@@ -376,6 +376,10 @@ func CreateModel(ctx context.Context, name model.Name, modelFileDir, quantizatio
 		switch command {
 		case "model", "adapter":
 			if name := model.ParseName(c.Args); name.IsValid() && command == "model" {
+				name, err := getExistingName(name)
+				if err != nil {
+					return err
+				}
 				baseLayers, err = parseFromModel(ctx, name, fn)
 				if err != nil {
 					return err
@@ -1076,17 +1080,15 @@ func makeRequest(ctx context.Context, method string, requestURL *url.URL, header
 		req.ContentLength = contentLength
 	}
 
-	resp, err := (&http.Client{
-		Transport: &http.Transport{
-			DialContext: testMakeRequestDialContext,
-		},
+	c := &http.Client{
 		CheckRedirect: regOpts.CheckRedirect,
-	}).Do(req)
-	if err != nil {
-		return nil, err
 	}
-
-	return resp, nil
+	if testMakeRequestDialContext != nil {
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.DialContext = testMakeRequestDialContext
+		c.Transport = tr
+	}
+	return c.Do(req)
 }
 
 func getValue(header, key string) string {
