@@ -215,6 +215,11 @@ struct ggml_backend_registry {
         GGML_LOG_DEBUG("%s: registered device %s (%s)\n", __func__, ggml_backend_dev_name(device), ggml_backend_dev_description(device));
 #endif
         devices.push_back({device, score});
+        std::stable_sort(devices.begin(), devices.end(),
+            [](const auto & a, const auto & b) {
+                return a.second > b.second;
+            }
+        );
     }
 
     ggml_backend_reg_t load_backend(const std::wstring & path, bool silent) {
@@ -338,12 +343,7 @@ size_t ggml_backend_dev_count() {
 
 ggml_backend_dev_t ggml_backend_dev_get(size_t index) {
     GGML_ASSERT(index < ggml_backend_dev_count());
-    auto devices = get_reg().devices;
-    if (!std::is_heap(devices.begin(), devices.end())) {
-        std::make_heap(devices.begin(), devices.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
-    }
-
-    return devices[index].first;
+    return get_reg().devices[index].first;
 }
 
 ggml_backend_dev_t ggml_backend_dev_by_name(const char * name) {
@@ -512,32 +512,33 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
         }
         fs::directory_iterator dir_it(search_path, fs::directory_options::skip_permission_denied);
         for (const auto & entry : dir_it) {
-            if (entry.is_regular_file()) {
-                std::wstring filename = entry.path().filename().wstring();
-                std::wstring ext = entry.path().extension().wstring();
-                if (filename.find(file_prefix) == 0 && ext == backend_filename_suffix()) {
-                    dl_handle_ptr handle { dl_load_library(entry.path().wstring()) };
-                    if (!handle && !silent) {
-                        GGML_LOG_ERROR("%s: failed to load %s\n", __func__, utf16_to_utf8(entry.path().wstring()).c_str());
-                    }
-                    if (handle) {
+            try {
+                if (entry.is_regular_file()) {
+                    std::wstring filename = entry.path().filename().wstring();
+                    std::wstring ext = entry.path().extension().wstring();
+                    if (filename.find(file_prefix) == 0 && ext == backend_filename_suffix()) {
+                        dl_handle_ptr handle { dl_load_library(entry.path().wstring()) };
+                        if (!handle) {
+                            GGML_LOG_ERROR("%s: failed to load %s\n", __func__, utf16_to_utf8(entry.path().wstring()).c_str());
+                            continue;
+                        }
+
                         auto score_fn = (ggml_backend_score_t) dl_get_sym(handle.get(), "ggml_backend_score");
-                        if (score_fn) {
-                            int s = score_fn();
-#ifndef NDEBUG
-                            GGML_LOG_DEBUG("%s: %s score: %d\n", __func__, utf16_to_utf8(entry.path().wstring()).c_str(), s);
-#endif
-                            if (s > best_score) {
-                                best_score = s;
-                                best_path = entry.path().wstring();
-                            }
-                        } else {
-                            if (!silent) {
-                                GGML_LOG_INFO("%s: failed to find ggml_backend_score in %s\n", __func__, utf16_to_utf8(entry.path().wstring()).c_str());
-                            }
+                        if (!score_fn) {
+                            GGML_LOG_DEBUG("%s: failed to find ggml_backend_score in %s\n", __func__, utf16_to_utf8(entry.path().wstring()).c_str());
+                            continue;
+                        }
+
+                        int s = score_fn();
+                        GGML_LOG_DEBUG("%s: %s score: %d\n", __func__, utf16_to_utf8(entry.path().wstring()).c_str(), s);
+                        if (s > best_score) {
+                            best_score = s;
+                            best_path = entry.path().wstring();
                         }
                     }
                 }
+            } catch (const std::exception & e) {
+                GGML_LOG_ERROR("%s: failed to load %s: %s\n", __func__, utf16_to_utf8(entry.path().wstring()).c_str(), e.what());
             }
         }
     }
