@@ -5,17 +5,12 @@
 .swp
 dist
 build
-ollama
 .cache
 *.exe
 .idea
 test_data
 *.crt
 __debug_bin*
-<<<<<<< HEAD
-llama/vendor
-llm/llama.cpp
-=======
 llama/build
 llama/vendor
->>>>>>> 65b7ecac7bd4346fae8f49764b0d6d2eb8de39ae
+llm/llama.cpp
